@@ -156,6 +156,14 @@ pub struct ExecutionResult<T> {
     pub call_result: T,
 }
 
+impl<T> ExecutionResult<T> {
+    pub fn map_result<U>(self, f: impl FnOnce(T) -> U) -> ExecutionResult<U> {
+        let Self { stats, call_result } = self;
+        let call_result = f(call_result);
+        ExecutionResult { stats, call_result }
+    }
+}
+
 pub type ReducerExecuteResult = ExecutionResult<Result<(), ExecutionError>>;
 
 pub type ViewExecuteResult = ExecutionResult<Result<Bytes, ExecutionError>>;
@@ -387,10 +395,8 @@ impl<T: WasmInstance> WasmModuleInstance<T> {
         &mut self,
         params: CallProcedureParams,
     ) -> Result<ProcedureCallResult, ProcedureCallError> {
-        let res = self.common.call_procedure(params, &mut self.instance).await;
-        if res.is_err() {
-            self.trapped = true;
-        }
+        let (res, trapped) = self.common.call_procedure(params, &mut self.instance).await;
+        self.trapped = trapped;
         res
     }
 }
@@ -576,11 +582,11 @@ impl InstanceCommon {
         Ok(self.execute_view_calls(tx, view_calls, inst))
     }
 
-    async fn call_procedure<I: WasmInstance>(
+    pub(crate) async fn call_procedure<I: WasmInstance>(
         &mut self,
         params: CallProcedureParams,
         inst: &mut I,
-    ) -> Result<ProcedureCallResult, ProcedureCallError> {
+    ) -> (Result<ProcedureCallResult, ProcedureCallError>, bool) {
         let CallProcedureParams {
             timestamp,
             caller_identity,
@@ -635,7 +641,9 @@ impl InstanceCommon {
             self.allocated_memory = memory_allocation;
         }
 
-        match call_result {
+        let trapped = call_result.is_err();
+
+        let res = match call_result {
             Err(err) => {
                 inst.log_traceback("procedure", &procedure_def.name, &err);
 
@@ -662,14 +670,16 @@ impl InstanceCommon {
                 let seed = spacetimedb_sats::WithTypespace::new(self.info.module_def.typespace(), return_type);
                 let return_val = seed
                     .deserialize(bsatn::Deserializer::new(&mut &return_val[..]))
-                    .map_err(|err| ProcedureCallError::InternalError(format!("{err}")))?;
-                Ok(ProcedureCallResult {
+                    .map_err(|err| ProcedureCallError::InternalError(format!("{err}")));
+                return_val.map(|return_val| ProcedureCallResult {
                     return_val,
                     execution_duration: timer.map(|timer| timer.elapsed()).unwrap_or_default(),
                     start_timestamp: timestamp,
                 })
             }
-        }
+        };
+
+        (res, trapped)
     }
 
     /// Execute a reducer.
